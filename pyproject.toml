@@ -1,0 +1,18 @@
+[project]
+name = "new-akiyam-multi-ai-agent-project"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "langchain>=1.1.2",
+    "langchain-anthropic>=1.2.0",
+    "langchain-community>=0.4.1",
+    "langchain-openai>=1.1.0",
+    "langgraph>=1.0.4",
+    "pinecone-client>=6.0.0",
+    "pypdf>=6.4.0",
+    "python-dotenv>=1.2.1",
+    "tavily-python>=0.7.14",
+    "tiktoken>=0.12.0",
+]

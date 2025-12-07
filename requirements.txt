@@ -1,0 +1,10 @@
+langchain
+langchain-community
+langchain-openai
+langchain-anthropic
+langgraph
+tavily-python
+pinecone-client
+python-dotenv
+pypdf
+tiktoken
