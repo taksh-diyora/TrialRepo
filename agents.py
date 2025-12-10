@@ -9,125 +9,161 @@ from langchain_core.messages import (
 )
 from langchain_cohere import ChatCohere
 from langgraph.graph import StateGraph, END
-
 from tools import tavily_tool, rag_tool
 
 
-# ============ LLM ============
+# ===================== LLM =====================
 llm = ChatCohere(
-    model="c4ai-aya-23-8b",          # Stable, free Cohere model
+    model="c4ai-aya-23-8b",
     cohere_api_key=os.getenv("COHERE_API_KEY"),
-    temperature=0,
+    temperature=0
 )
 
 
-# ============ STATE ============
+# ===================== MEMORY =====================
+MEMORY = []           # stores entire conversation
+MEMORY_LIMIT = 10     # keep last N pairs
+
+
+def add_to_memory(message: BaseMessage):
+    """Store user + AI messages, but limit size."""
+    MEMORY.append(message)
+    if len(MEMORY) > MEMORY_LIMIT:
+        MEMORY.pop(0)
+
+
+def get_memory():
+    """Return memory messages for workers."""
+    return MEMORY[-MEMORY_LIMIT:]
+
+
+# ===================== STATE =====================
 class AgentState(TypedDict):
-    # LangGraph will keep appending messages from each node
     messages: Annotated[Sequence[BaseMessage], operator.add]
-    # Used only by Supervisor to decide routing
     next: str
 
 
-# ============ SUPERVISOR ============
+# ===================== SUPERVISOR =====================
 def supervisor_node(state: AgentState):
-    """Route based ONLY on the latest HUMAN message."""
+    """
+    IMPORTANT:
+    Supervisor should NOT see memory.
+    It should ONLY react to the latest USER message.
+    """
+    last_msg = state["messages"][-1]
 
-    # Filter only HumanMessage objects
-    human_messages = [m for m in state["messages"] if isinstance(m, HumanMessage)]
-    if not human_messages:
+    if isinstance(last_msg, AIMessage):
+        # AI messages are NOT routing triggers → go straight to FINISH
         return {"next": "FINISH"}
 
-    query = human_messages[-1].content.lower().strip()
+    query = last_msg.content.lower()
 
-    # Stop conditions
+    if any(w in query for w in ["pdf", "document", "file", "page"]):
+        return {"next": "PDF_Analyst"}
+
     if query in ["quit", "exit", "bye"]:
         return {"next": "FINISH"}
 
-    # PDF-related routing
-    pdf_keywords = ["pdf", "document", "file", "page", "pages"]
-    if any(word in query for word in pdf_keywords):
-        return {"next": "PDF_Analyst"}
-
-    # Default: web search
     return {"next": "Web_Searcher"}
 
 
-# ============ WEB SEARCHER ============
+# ===================== WEB SEARCH WORKER =====================
 def web_search_node(state: AgentState):
-    """Uses Tavily + LLM to answer general web questions with sources."""
-
     query = state["messages"][-1].content
 
-    # Call Tavily search (langchain_tavily.TavilySearch)
-    search_results = tavily_tool.invoke({"query": query})
+    # Worker gets memory
+    memory_msgs = get_memory()
+
+    results = tavily_tool.invoke({"query": query})
 
     prompt = f"""
-You are a helpful assistant. Use ONLY the following web search results to answer.
+    You are a factual answering agent.
 
-QUESTION:
-{query}
+    Using ONLY the verified search results below + conversation memory,
+    produce a clear and well-structured answer.
 
-SEARCH RESULTS (JSON-like):
-{search_results}
+    === MEMORY ===
+    {memory_msgs}
 
-Respond in this format:
+    === QUESTION ===
+    {query}
 
-- **Answer:** <short, accurate answer in 2–4 sentences>
-- **Sources:**
-  - <source 1 name or domain + URL if available>
-  - <source 2 name or domain + URL if available>
-"""
+    === SEARCH RESULTS ===
+    {results}
+
+    FORMAT YOUR ANSWER EXACTLY LIKE THIS:
+
+    **Answer:**  
+    <2–5 sentence factual answer>
+
+    **Sources:**  
+    - <source 1 name or domain>  
+    - <source 2 name or domain>  
+    - <source 3 name or domain>  
+
+    Make sure:
+    - Answer is short but accurate  
+    - Sources list ONLY real domains found in the search results  
+    - No hallucinated sources  
+    """
+
 
     response = llm.invoke([HumanMessage(content=prompt)])
+    ai_msg = AIMessage(content=response.content, name="Web_Searcher")
+
+    add_to_memory(HumanMessage(content=query))
+    add_to_memory(ai_msg)
 
     return {
-        "messages": [
-            AIMessage(content=response.content, name="Web_Searcher")
-        ]
+        "messages": [ai_msg],
+        "next": "Supervisor"
     }
 
 
-# ============ PDF ANALYST ============
+# ===================== PDF ANALYST WORKER =====================
 def pdf_analyst_node(state: AgentState):
-    """Stub/real PDF agent using rag_tool. Currently just echoes a stub message."""
-
     query = state["messages"][-1].content
 
-    # We design rag_tool to accept a simple string query
-    result = rag_tool.invoke(query)
+    memory_msgs = get_memory()
+
+    results = rag_tool.invoke({"query": query})
+    final_answer = f"""
+    Using conversation memory + PDF retrieval:
+    MEMORY: {memory_msgs}
+    RESULT: {results}
+    """
+
+    ai_msg = AIMessage(content=final_answer, name="PDF_Analyst")
+
+    add_to_memory(HumanMessage(content=query))
+    add_to_memory(ai_msg)
 
     return {
-        "messages": [
-            AIMessage(content=str(result), name="PDF_Analyst")
-        ]
+        "messages": [ai_msg],
+        "next": "Supervisor"
     }
 
 
-# ============ GRAPH BUILDING ============
+# ===================== GRAPH =====================
 workflow = StateGraph(AgentState)
 
-# Nodes
 workflow.add_node("Supervisor", supervisor_node)
 workflow.add_node("Web_Searcher", web_search_node)
 workflow.add_node("PDF_Analyst", pdf_analyst_node)
 
-# Entry point
 workflow.set_entry_point("Supervisor")
 
-# Routing from Supervisor based on `next`
 workflow.add_conditional_edges(
     "Supervisor",
-    lambda state: state["next"],
+    lambda x: x["next"],
     {
         "Web_Searcher": "Web_Searcher",
         "PDF_Analyst": "PDF_Analyst",
         "FINISH": END,
-    },
+    }
 )
 
-# After either worker, we end the run (one answer per user question)
-workflow.add_edge("Web_Searcher", END)
-workflow.add_edge("PDF_Analyst", END)
+workflow.add_edge("Web_Searcher", "Supervisor")
+workflow.add_edge("PDF_Analyst", "Supervisor")
 
 graph = workflow.compile()
